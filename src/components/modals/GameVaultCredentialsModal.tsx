@@ -28,6 +28,7 @@ import {
 import { useTranslation } from "react-i18next";
 
 import { StoragePathPicker } from "./StoragePathPicker";
+import { FiEye, FiEyeOff } from "react-icons/fi";
 
 interface Props {
   /** Rejecting keeps the modal open with the message shown inline, so a
@@ -63,6 +64,7 @@ export const GameVaultCredentialsModal: FC<Props> = ({
   const [serverUrl, setServerUrl] = useState(initialServerUrl);
   const [username, setUsername] = useState(initialUsername);
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [verifySsl, setVerifySsl] = useState(initialVerifySsl);
   const [downloadDir, setDownloadDir] = useState(initialDownloadDir);
   const [browsing, setBrowsing] = useState(false);
@@ -142,14 +144,24 @@ export const GameVaultCredentialsModal: FC<Props> = ({
           value={username}
           onChange={(e) => setUsername(e.target.value)}
         />
-
-        <TextField
-          label={t("gamevault.password")}
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          type="password"
-        />
-
+        {/* CSS to force passwork masking, as bIsPassword doesn't work anymore
+            and {...{type: password}} doesn't work in desktop BPM. */}
+        <style>{`.gamevault-password input { -webkit-text-security: disk; }`}</style>
+        <div className={showPassword ? undefined : "gamevault-password"}>
+          <TextField
+            label={t("gamevault.password")}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            inlineControls={
+              <DialogButton
+                style={{ minWidth: 0, width: 40, padding: 0 }}
+                onClick={() => setShowPassword((s) => !s)}
+              >
+                {showPassword ? <FiEyeOff /> : <FiEye />}
+              </DialogButton>
+            }
+          />
+        </div>
         {/* ── TLS toggle ───────────────────────────────────────── */}
         <ToggleField
           label={t("gamevault.verifySsl")}
