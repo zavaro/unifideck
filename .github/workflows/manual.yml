@@ -1,0 +1,180 @@
+# This is a basic workflow that is manually triggered
+
+name: Manual workflow
+
+# Controls when the action will run. Workflow runs when manually triggered using the UI
+# or API.
+on:
+  workflow_dispatch:
+    # Inputs the workflow accepts.
+    inputs:
+      name:
+        default: 'testing'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # The whole job historically runs in ~70s. Without this it
+    # inherits GitHub's 6-hour default, so one stalled network
+    # fetch pins the PR check as "in progress" for a full day of
+    # runner time before anything reports back.
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── i18n: translate + generate locale catalog ──────────
+
+      - name: Set up Python for i18n scripts
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Detect DeepL API key
+        # The `secrets` context is not usable in a step-level
+        # `if:`, so probe the secret once here and gate on this
+        # step's output. Scoping the env to this one step keeps
+        # the key out of pnpm, the Decky CLI, and everything else.
+        id: deepl
+        env:
+          DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+        run: |
+          if [ -n "$DEEPL_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No DEEPL_API_KEY - skipping machine translation; locale JSONs are maintained manually."
+          fi
+
+      - name: Translate en-US.json via DeepL (if key present)
+        # Only calls DeepL for keys whose MD5 has changed since
+        # the last run. If en-US.json is unchanged → zero API
+        # calls, zero quota consumed. With no key configured (the
+        # current manual-translation workflow, and fork PRs) the
+        # step is skipped entirely and the build carries on.
+        if: steps.deepl.outputs.present == 'true'
+        env:
+          DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+        run: python3 scripts/translate_at_build.py
+
+      - name: Regenerate locales.generated.ts from config.json
+        # Reads defaults/config.json i18n section and emits
+        # src/i18n/locales.generated.ts with static imports,
+        # SUPPORTED_LANGUAGES, LANGUAGE_NAMES, RTL_LANGUAGES,
+        # and LOCALE_RESOURCES. Single source of truth.
+        run: python3 scripts/gen_locale_imports.py
+
+      - name: Lint frontend for RTL-unsafe CSS patterns
+        # Fails if any src/ TS/TSX file uses directional CSS
+        # (marginLeft, textAlign:"left", ChevronRight, etc.)
+        # that wouldn't auto-flip in right-to-left mode.
+        run: python3 scripts/lint_rtl.py
+
+      - name: Check translation-key coverage
+        # Orphans (a t("key") no locale declares) and completeness
+        # (an en-US key missing from another locale, which falls
+        # back to English silently).
+        run: python3 scripts/check_orphan_keys.py
+
+      - name: Check translations are actually translated
+        # Presence is not translation: a key copied verbatim into
+        # all 16 locales passes the check above while every
+        # non-English user reads English. Also enforces
+        # {{placeholder}} parity against en-US. Intentional
+        # matches live in scripts/i18n_allowlist.json.
+        run: python3 scripts/check_untranslated.py
+
+      - name: Check for hardcoded user-facing strings
+        # A toast built from a raw literal never becomes a key at
+        # all, so neither check above can see it. Covers the
+        # frontend toast calls and the backend/launcher emitters.
+        run: python3 scripts/check_hardcoded_strings.py
+
+      - name: Check toast strings fit the toast
+        # A toast field (header, body, action label) holds 16
+        # characters in every locale (22 width units in CJK), and
+        # every backend toast names its feature with a
+        # toasts.header.* key. A longer translation is cut off on
+        # screen, and nothing else catches it.
+        run: python3 scripts/check_toast_length.py
+
+      - name: Commit regenerated locale files
+        # Only on push (not PR) — PRs can't write to the target
+        # repo. Commits any locale JSONs or generated TS that
+        # were updated by the translate/gen steps above. With
+        # DeepL skipped only locales.generated.ts can change.
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "unifideck-bot"
+          git config user.email "bot@unifideck.invalid"
+          git add src/i18n/locales/*.json src/i18n/.translation-cache.json src/i18n/locales.generated.ts || true
+          if git diff --cached --quiet; then
+            echo "No locale changes to commit"
+          else
+            git commit -m "chore(i18n): regenerate locale catalog"
+            git push
+          fi
+
+      # ── Frontend: install, lint, typecheck, build ──────────
+
+      # No `apt-get install cabextract` step here: cabextract is a
+      # RUNTIME dependency of winetricks on the Deck, and winetricks
+      # never runs in CI. The step was vestigial and its `apt-get
+      # update` stalled on an Ubuntu mirror for 6h on 2026-08-19,
+      # burning the job timeout. Nothing else in the tree calls it.
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint with ESLint
+        # Semantic code quality: React hooks rules, unused vars,
+        # TypeScript best practices, a11y violations. Does NOT
+        # check formatting — that's Prettier's job.
+        run: pnpm run lint
+
+      - name: Type-check with TypeScript
+        # Strict mode: noImplicitAny, noUnusedLocals,
+        # noImplicitReturns — catches type errors that ESLint
+        # and Rollup would miss.
+        run: pnpm run typecheck
+
+      - name: Build frontend
+        run: pnpm run build
+
+      # ── Decky CLI: package the plugin zip ──────────────────
+
+      - name: Download Decky CLI
+        run: |
+          mkdir -p cli
+          curl -L -o cli/decky https://github.com/SteamDeckHomebrew/cli/releases/download/0.0.8/decky-linux-x86_64
+          chmod +x cli/decky
+
+      - name: Build plugin with Decky CLI
+        run: cli/decky plugin build .
+
+      - name: Extract plugin zip for artifact
+        run: |
+          mkdir -p out/Unifideck
+          unzip out/Unifideck.zip -d out/Unifideck
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unifideck
+          path: out/Unifideck/
+          if-no-files-found: error
